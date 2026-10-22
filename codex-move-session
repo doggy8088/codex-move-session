@@ -1,0 +1,722 @@
+#!/usr/bin/env bash
+#
+# codex-move-session
+#
+# Move a Codex CLI session between two CODEX_HOME directories.
+# The alias table is intentionally small and easy to edit.
+#
+#   home   -> $HOME/.codex
+#   pro500 -> $HOME/games/.codex
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+
+ALIAS_HOME="$HOME/.codex"
+ALIAS_PRO500="$HOME/games/.codex"
+
+COPY=0
+DRY_RUN=0
+FORCE=0
+FROM_ARG=""
+ID=""
+TARGET_ARG=""
+TARGET_HOME=""
+TARGET_LABEL=""
+SOURCE_HOME=""
+SOURCE_LABEL=""
+SRC_INDEX=""
+DST_INDEX=""
+CANONICAL=""
+SRC_COUNT=0
+DST_COUNT=0
+STAMP=""
+DST_INDEX_CREATED=0
+DST_INDEX_BAK=""
+SRC_INDEX_BAK=""
+
+SRC_FILES=()
+MOVED_SRC=()
+MOVED_DST=()
+BACKUP_DST=()
+BACKUP_PATH=()
+TMP_FILES=()
+LAST_BACKUP=""
+
+cleanup() {
+  local f
+  for f in ${TMP_FILES[@]+"${TMP_FILES[@]}"}; do
+    rm -f -- "$f" 2>/dev/null || true
+  done
+}
+
+trap cleanup EXIT
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+show_version() {
+  printf 'codex-move-session v%s\n' "$VERSION"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-move-session <session-id> <target> [options]
+
+Targets:
+  home    $HOME/.codex
+  pro500  $HOME/games/.codex
+  /path   Any existing CODEX_HOME directory (absolute path or ~/...)
+
+Options:
+  --from <alias|path>  Explicit source (when auto-detection is ambiguous)
+  --copy               Copy instead of move; leave source files/index intact
+  --dry-run            Show what would happen without changing anything
+  --force              Replace an existing destination copy; backs up files
+  -v, --version        Show version
+  -h, --help           Show this help
+
+Examples:
+  codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 home
+  codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 pro500 --dry-run
+  codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 /tmp/other-codex --from home
+
+Notes:
+  - Moves rollout-*.jsonl and rollout-*.jsonl.zst files, including fork files
+    named rollout-*-<session-id>_<fork-id>.jsonl.
+  - Moves matching session_index.jsonl lines and deduplicates by session id.
+  - history.jsonl, state_5.sqlite, and thread_history_1.sqlite are not changed.
+  - Close Codex before running to avoid concurrent index writes.
+  - If the destination picker does not show the session, run:
+      CODEX_HOME=<destination> codex migrate-rollouts --apply
+EOF
+}
+
+resolve_home() {
+  local raw=$1
+
+  if [ "$raw" = "~" ]; then
+    printf '%s\n' "$HOME"
+    return 0
+  fi
+
+  if [ "${raw:0:1}" = "~" ] && [ "${raw:1:1}" = "/" ]; then
+    printf '%s\n' "$HOME/${raw:2}"
+    return 0
+  fi
+
+  case "$raw" in
+    home)
+      printf '%s\n' "$ALIAS_HOME"
+      ;;
+    pro500)
+      printf '%s\n' "$ALIAS_PRO500"
+      ;;
+    /*)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+canonical_dir() {
+  (cd "$1" 2>/dev/null && pwd -P)
+}
+
+home_label() {
+  local path=$1
+  local h
+
+  h=$(canonical_dir "$ALIAS_HOME" 2>/dev/null || true)
+  if [ -n "$h" ] && [ "$path" = "$h" ]; then
+    printf 'home'
+    return 0
+  fi
+
+  h=$(canonical_dir "$ALIAS_PRO500" 2>/dev/null || true)
+  if [ -n "$h" ] && [ "$path" = "$h" ]; then
+    printf 'pro500'
+    return 0
+  fi
+
+  printf '%s' "$path"
+}
+
+validate_index() {
+  local file=$1
+  [ -f "$file" ] || return 0
+  jq -e -s 'all(.[]; type == "object" and (.id | type == "string"))' "$file" >/dev/null 2>&1
+}
+
+discover_files() {
+  local home=$1
+  local f
+
+  SRC_FILES=()
+  [ -d "$home/sessions" ] || return 0
+
+  while IFS= read -r -d '' f; do
+    SRC_FILES+=("$f")
+  done < <(
+    find "$home/sessions" -type f \( \
+      -name "rollout-*-${ID}.jsonl" -o \
+      -name "rollout-*-${ID}.jsonl.zst" -o \
+      -name "rollout-*-${ID}_*.jsonl" -o \
+      -name "rollout-*-${ID}_*.jsonl.zst" \
+      \) -print0
+  )
+}
+
+count_id_entries() {
+  local file=$1
+  if [ ! -f "$file" ]; then
+    printf '0\n'
+    return 0
+  fi
+  jq -c --arg id "$ID" 'select(.id == $id)' "$file" 2>/dev/null |
+    awk 'NF { n++ } END { print n+0 }'
+}
+
+canonical_entry() {
+  local file=$1
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  jq -s -c --arg id "$ID" \
+    'map(select(.id == $id)) | sort_by((.updated_at // "") | tostring) | last // empty' \
+    "$file"
+}
+
+file_mode() {
+  stat -f '%Lp' "$1" 2>/dev/null ||
+    stat -c '%a' "$1" 2>/dev/null ||
+    printf '644'
+}
+
+backup_path() {
+  local path=$1
+  local bak="${path}.bak.${STAMP}"
+  if [ -e "$bak" ]; then
+    bak="${bak}.$$"
+  fi
+  printf '%s' "$bak"
+}
+
+backup_file() {
+  local src=$1
+  local bak
+  bak=$(backup_path "$src")
+  cp -p -- "$src" "$bak" || return 1
+  LAST_BACKUP=$bak
+  printf 'backup: %s\n' "$bak"
+}
+
+rollback_files() {
+  local i
+  for ((i = ${#MOVED_DST[@]} - 1; i >= 0; i--)); do
+    if [ "$COPY" -eq 1 ]; then
+      rm -f -- "${MOVED_DST[$i]}" 2>/dev/null || true
+    elif [ -e "${MOVED_DST[$i]}" ]; then
+      mkdir -p -- "$(dirname "${MOVED_SRC[$i]}")" 2>/dev/null || true
+      mv -- "${MOVED_DST[$i]}" "${MOVED_SRC[$i]}" 2>/dev/null || true
+    fi
+  done
+  MOVED_SRC=()
+  MOVED_DST=()
+}
+
+restore_indexes() {
+  if [ "$DST_INDEX_CREATED" -eq 1 ]; then
+    rm -f -- "$DST_INDEX" 2>/dev/null || true
+  elif [ -n "$DST_INDEX_BAK" ] && [ -f "$DST_INDEX_BAK" ]; then
+    cp -p -- "$DST_INDEX_BAK" "$DST_INDEX" 2>/dev/null || true
+  fi
+
+  if [ -n "$SRC_INDEX_BAK" ] && [ -f "$SRC_INDEX_BAK" ]; then
+    cp -p -- "$SRC_INDEX_BAK" "$SRC_INDEX" 2>/dev/null || true
+  fi
+}
+
+restore_backups() {
+  local i
+  for ((i = ${#BACKUP_DST[@]} - 1; i >= 0; i--)); do
+    if [ -f "${BACKUP_PATH[$i]}" ]; then
+      cp -p -- "${BACKUP_PATH[$i]}" "${BACKUP_DST[$i]}" 2>/dev/null || true
+    fi
+  done
+  BACKUP_DST=()
+  BACKUP_PATH=()
+}
+
+abort_after_files() {
+  warn "$1"
+  restore_indexes
+  rollback_files
+  restore_backups
+  die "move aborted; source files and indexes were restored where possible"
+}
+
+ensure_target_layout() {
+  if [ ! -d "$TARGET_HOME/sessions" ]; then
+    warn "creating destination sessions directory: $TARGET_HOME/sessions"
+    mkdir -p -- "$TARGET_HOME/sessions" || die "cannot create $TARGET_HOME/sessions"
+  fi
+
+  if [ ! -f "$DST_INDEX" ]; then
+    warn "creating empty destination session index: $DST_INDEX"
+    : >"$DST_INDEX" || die "cannot create $DST_INDEX"
+    chmod 644 "$DST_INDEX" 2>/dev/null || true
+    DST_INDEX_CREATED=1
+  fi
+}
+
+rewrite_dest_index() {
+  local mode
+  local tmp
+
+  mode=$(file_mode "$DST_INDEX")
+  tmp=$(mktemp "${DST_INDEX}.tmp.XXXXXX") || return 1
+  TMP_FILES+=("$tmp")
+
+  if [ -n "$CANONICAL" ]; then
+    jq -s -c --arg id "$ID" --argjson entry "$CANONICAL" \
+      'map(select(.id != $id)) + [$entry] | sort_by((.updated_at // "") | tostring)[]' \
+      "$DST_INDEX" >"$tmp" || return 1
+  else
+    jq -s -c --arg id "$ID" \
+      'map(select(.id != $id)) | sort_by((.updated_at // "") | tostring)[]' \
+      "$DST_INDEX" >"$tmp" || return 1
+  fi
+
+  chmod "$mode" "$tmp" 2>/dev/null || true
+  mv -- "$tmp" "$DST_INDEX" || return 1
+  validate_index "$DST_INDEX" || return 1
+}
+
+rewrite_src_index() {
+  local mode
+  local tmp
+
+  mode=$(file_mode "$SRC_INDEX")
+  tmp=$(mktemp "${SRC_INDEX}.tmp.XXXXXX") || return 1
+  TMP_FILES+=("$tmp")
+
+  jq -c --arg id "$ID" 'select(.id != $id)' "$SRC_INDEX" >"$tmp" || return 1
+  chmod "$mode" "$tmp" 2>/dev/null || true
+  mv -- "$tmp" "$SRC_INDEX" || return 1
+  validate_index "$SRC_INDEX" || return 1
+}
+
+print_plan() {
+  local verb=move
+  local f
+  local rel
+  local dst
+
+  if [ "$COPY" -eq 1 ]; then
+    verb=copy
+  fi
+
+  printf '[dry-run] session: %s\n' "$ID"
+  printf '[dry-run] from:    %s (%s)\n' "$SOURCE_LABEL" "$SOURCE_HOME"
+  printf '[dry-run] to:      %s (%s)\n' "$TARGET_LABEL" "$TARGET_HOME"
+  printf '[dry-run] mode:    %s\n' "$verb"
+
+  for f in "${SRC_FILES[@]}"; do
+    rel=${f#"$SOURCE_HOME"/}
+    printf '[dry-run] %s %s -> %s\n' "$verb" "$f" "$TARGET_HOME/$rel"
+  done
+
+  if [ "$SRC_COUNT" -gt 0 ]; then
+    if [ "$COPY" -eq 1 ]; then
+      printf '[dry-run] index:   keep %s source entry/entries; add 1 destination entry\n' "$SRC_COUNT"
+    else
+      printf '[dry-run] index:   remove %s source entry/entries; add 1 destination entry\n' "$SRC_COUNT"
+    fi
+  else
+    printf '[dry-run] index:   no source entry found; index files would not change\n'
+  fi
+
+  if [ "$FORCE" -eq 1 ]; then
+    for f in "${SRC_FILES[@]}"; do
+      rel=${f#"$SOURCE_HOME"/}
+      dst="$TARGET_HOME/$rel"
+      if [ -e "$dst" ]; then
+        printf '[dry-run] backup:  %s (existing destination file)\n' "$(backup_path "$dst")"
+      fi
+    done
+
+    if [ "$DST_COUNT" -gt 0 ] && [ -n "$CANONICAL" ]; then
+      printf '[dry-run] backup:  %s (existing destination index)\n' "$(backup_path "$DST_INDEX")"
+    fi
+  fi
+}
+
+parse_args() {
+  local pos=()
+  local arg
+
+  while [ $# -gt 0 ]; do
+    arg=$1
+    case "$arg" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -v | --version)
+        show_version
+        exit 0
+        ;;
+      --copy)
+        COPY=1
+        shift
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --force)
+        FORCE=1
+        shift
+        ;;
+      --from)
+        [ $# -ge 2 ] || die "--from requires an alias or CODEX_HOME path"
+        [ -n "$2" ] || die "--from requires a non-empty alias or path"
+        FROM_ARG=$2
+        shift 2
+        ;;
+      --from=*)
+        FROM_ARG=${arg#--from=}
+        [ -n "$FROM_ARG" ] || die "--from requires a non-empty alias or path"
+        shift
+        ;;
+      --)
+        shift
+        while [ $# -gt 0 ]; do
+          pos+=("$1")
+          shift
+        done
+        ;;
+      -*)
+        die "unknown option: $arg (try --help)"
+        ;;
+      *)
+        pos+=("$arg")
+        shift
+        ;;
+    esac
+  done
+
+  if [ ${#pos[@]} -ne 2 ]; then
+    usage >&2
+    die "expected: <session-id> <target>"
+  fi
+
+  ID=$(printf '%s' "${pos[0]}" | tr '[:upper:]' '[:lower:]')
+  TARGET_ARG=${pos[1]}
+}
+
+main() {
+  local target_raw
+  local from_raw
+  local alias
+  local h_raw
+  local h
+  local auto_count
+  local ambiguous
+  local index_only
+  local conflicts
+  local f
+  local rel
+  local dst
+  local d
+  local sessions_root
+  local verb
+  local after
+  local auto_names=()
+  local auto_homes=()
+
+  parse_args "$@"
+
+  if ! [[ "$ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    die "invalid session id: $ID (expected UUID form xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+  fi
+
+  STAMP=$(date +%Y%m%d-%H%M%S)
+
+  target_raw=$(resolve_home "$TARGET_ARG") ||
+    die "unknown target '$TARGET_ARG' (use home, pro500, or an absolute/~/ path)"
+  TARGET_HOME=$(canonical_dir "$target_raw") ||
+    die "target CODEX_HOME does not exist: $target_raw"
+  TARGET_LABEL=$(home_label "$TARGET_HOME")
+
+  if [ -n "$FROM_ARG" ]; then
+    from_raw=$(resolve_home "$FROM_ARG") ||
+      die "unknown --from value '$FROM_ARG' (use home, pro500, or an absolute/~/ path)"
+    SOURCE_HOME=$(canonical_dir "$from_raw") ||
+      die "source CODEX_HOME does not exist: $from_raw"
+    if [ "$SOURCE_HOME" = "$TARGET_HOME" ]; then
+      die "source and target are the same CODEX_HOME: $SOURCE_HOME"
+    fi
+
+    discover_files "$SOURCE_HOME"
+    if [ ${#SRC_FILES[@]} -eq 0 ]; then
+      die "no rollout files found for $ID under $SOURCE_HOME"
+    fi
+    SOURCE_LABEL=$(home_label "$SOURCE_HOME")
+  else
+    auto_count=0
+    ambiguous=0
+
+    for alias in home pro500; do
+      if [ "$alias" = home ]; then
+        h_raw=$ALIAS_HOME
+      else
+        h_raw=$ALIAS_PRO500
+      fi
+
+      h=$(canonical_dir "$h_raw" 2>/dev/null) || continue
+      if [ "$h" = "$TARGET_HOME" ]; then
+        continue
+      fi
+
+      discover_files "$h"
+      if [ ${#SRC_FILES[@]} -gt 0 ]; then
+        auto_count=$((auto_count + 1))
+        auto_names+=("$alias")
+        auto_homes+=("$h")
+        if [ "$auto_count" -gt 1 ]; then
+          ambiguous=1
+        fi
+      fi
+    done
+
+    if [ "$ambiguous" -eq 1 ]; then
+      die "session found in multiple CODEX_HOMEs (${auto_names[*]}); use --from home|pro500"
+    fi
+
+    if [ "$auto_count" -eq 0 ]; then
+      index_only=""
+      for alias in home pro500; do
+        if [ "$alias" = home ]; then
+          h=$ALIAS_HOME
+        else
+          h=$ALIAS_PRO500
+        fi
+        if [ -f "$h/session_index.jsonl" ] &&
+          jq -e --arg id "$ID" 'select(.id == $id)' "$h/session_index.jsonl" >/dev/null 2>&1; then
+          index_only="$index_only $alias"
+        fi
+      done
+
+      if [ -n "$index_only" ]; then
+        die "session index entry found in$index_only but no rollout file; refusing to move only an index entry"
+      fi
+      die "no rollout files found for $ID under home or pro500"
+    fi
+
+    SOURCE_HOME=${auto_homes[0]}
+    SOURCE_LABEL=${auto_names[0]}
+    discover_files "$SOURCE_HOME"
+  fi
+
+  SRC_INDEX="$SOURCE_HOME/session_index.jsonl"
+  DST_INDEX="$TARGET_HOME/session_index.jsonl"
+
+  if [ -f "$SRC_INDEX" ]; then
+    validate_index "$SRC_INDEX" ||
+      die "source session index is not valid JSONL: $SRC_INDEX"
+  else
+    warn "source session index not found: $SRC_INDEX"
+  fi
+
+  if [ -f "$DST_INDEX" ]; then
+    validate_index "$DST_INDEX" ||
+      die "destination session index is not valid JSONL: $DST_INDEX"
+  fi
+
+  SRC_COUNT=$(count_id_entries "$SRC_INDEX")
+  DST_COUNT=$(count_id_entries "$DST_INDEX")
+
+  if [ "$SRC_COUNT" -gt 1 ]; then
+    warn "source session index has $SRC_COUNT entries for $ID; keeping the newest updated_at entry"
+  fi
+
+  if [ "$SRC_COUNT" -gt 0 ]; then
+    CANONICAL=$(canonical_entry "$SRC_INDEX")
+    if [ -z "$CANONICAL" ]; then
+      warn "could not read a session index entry for $ID; indexes will not be changed"
+    fi
+  else
+    warn "no session_index entry found for $ID in source; only rollout files will be moved"
+  fi
+
+  conflicts=()
+  for f in "${SRC_FILES[@]}"; do
+    rel=${f#"$SOURCE_HOME"/}
+    dst="$TARGET_HOME/$rel"
+    if [ -e "$dst" ]; then
+      conflicts+=("file: $dst")
+    fi
+  done
+
+  if [ "$DST_COUNT" -gt 0 ]; then
+    conflicts+=("index: $DST_INDEX ($DST_COUNT entry/entries for $ID)")
+  fi
+
+  if [ ${#conflicts[@]} -gt 0 ]; then
+    if [ "$FORCE" -eq 0 ]; then
+      printf 'error: destination already contains this session:\n' >&2
+      for f in "${conflicts[@]}"; do
+        printf '  %s\n' "$f" >&2
+      done
+      printf 'Use --force to replace the destination copy; overwritten files are backed up.\n' >&2
+      exit 1
+    fi
+    warn "destination already contains this session; --force will replace it"
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if [ ! -d "$TARGET_HOME/sessions" ]; then
+      warn "destination sessions directory does not exist (would create): $TARGET_HOME/sessions"
+    fi
+    if [ ! -f "$DST_INDEX" ]; then
+      warn "destination session index does not exist (would create): $DST_INDEX"
+    fi
+    print_plan
+    exit 0
+  fi
+
+  ensure_target_layout
+
+  if [ -f "$DST_INDEX" ]; then
+    DST_INDEX_BAK=$(mktemp "${TMPDIR:-/tmp}/codex-dst-index.XXXXXX") ||
+      die "cannot create a temporary destination index backup"
+    TMP_FILES+=("$DST_INDEX_BAK")
+    cp -p -- "$DST_INDEX" "$DST_INDEX_BAK" ||
+      die "cannot back up destination index: $DST_INDEX"
+  fi
+
+  if [ "$COPY" -eq 0 ] && [ -n "$CANONICAL" ] && [ -f "$SRC_INDEX" ]; then
+    SRC_INDEX_BAK=$(mktemp "${TMPDIR:-/tmp}/codex-src-index.XXXXXX") ||
+      die "cannot create a temporary source index backup"
+    TMP_FILES+=("$SRC_INDEX_BAK")
+    cp -p -- "$SRC_INDEX" "$SRC_INDEX_BAK" ||
+      die "cannot back up source index: $SRC_INDEX"
+  fi
+
+  if [ "$FORCE" -eq 1 ] && [ "$DST_COUNT" -gt 0 ] && [ -n "$CANONICAL" ]; then
+    backup_file "$DST_INDEX" || die "cannot back up destination index: $DST_INDEX"
+  fi
+
+  MOVED_SRC=()
+  MOVED_DST=()
+  BACKUP_DST=()
+  BACKUP_PATH=()
+  if [ "$COPY" -eq 1 ]; then
+    verb=copy
+  else
+    verb=move
+  fi
+
+  for f in "${SRC_FILES[@]}"; do
+    rel=${f#"$SOURCE_HOME"/}
+    dst="$TARGET_HOME/$rel"
+
+    mkdir -p -- "$(dirname "$dst")" ||
+      abort_after_files "cannot create destination directory for $dst"
+
+    if [ -e "$dst" ]; then
+      if [ "$FORCE" -eq 0 ]; then
+        abort_after_files "destination file appeared during move: $dst"
+      fi
+      backup_file "$dst" ||
+        abort_after_files "cannot back up destination file: $dst"
+      BACKUP_DST+=("$dst")
+      BACKUP_PATH+=("$LAST_BACKUP")
+    fi
+
+    if [ "$COPY" -eq 1 ]; then
+      if ! cp -p -- "$f" "$dst"; then
+        rm -f -- "$dst" 2>/dev/null || true
+        abort_after_files "failed to copy $f to $dst"
+      fi
+    else
+      if ! mv -- "$f" "$dst"; then
+        if [ -f "$f" ]; then
+          rm -f -- "$dst" 2>/dev/null || true
+        fi
+        abort_after_files "failed to move $f to $dst"
+      fi
+    fi
+
+    MOVED_SRC+=("$f")
+    MOVED_DST+=("$dst")
+    printf '%s: %s -> %s\n' "$verb" "$f" "$dst"
+  done
+
+  if [ -n "$CANONICAL" ]; then
+    if ! rewrite_dest_index; then
+      abort_after_files "failed to update destination session index: $DST_INDEX"
+    fi
+    printf 'index: added %s to %s\n' "$ID" "$DST_INDEX"
+
+    if [ "$COPY" -eq 0 ] && [ -f "$SRC_INDEX" ]; then
+      if ! rewrite_src_index; then
+        abort_after_files "failed to update source session index: $SRC_INDEX"
+      fi
+      printf 'index: removed %s from %s\n' "$ID" "$SRC_INDEX"
+    fi
+  elif [ "$SRC_COUNT" -gt 0 ]; then
+    warn "session index entry could not be read; indexes left unchanged"
+  fi
+
+  if [ -n "$CANONICAL" ]; then
+    after=$(count_id_entries "$DST_INDEX")
+    if [ "$after" -ne 1 ]; then
+      abort_after_files "destination index verification failed ($after entries for $ID)"
+    fi
+
+    if [ "$COPY" -eq 0 ] && [ -f "$SRC_INDEX" ]; then
+      after=$(count_id_entries "$SRC_INDEX")
+      if [ "$after" -ne 0 ]; then
+        abort_after_files "source index verification failed ($after entries for $ID)"
+      fi
+    fi
+  fi
+
+  if [ "$COPY" -eq 0 ]; then
+    sessions_root="$SOURCE_HOME/sessions"
+    for f in "${SRC_FILES[@]}"; do
+      d=$(dirname "$f")
+      while [ "$d" != "$sessions_root" ] && [ "$d" != "/" ]; do
+        if [[ "$d" != "$sessions_root"/* ]]; then
+          break
+        fi
+        if ! rmdir -- "$d" 2>/dev/null; then
+          break
+        fi
+        d=$(dirname "$d")
+      done
+    done
+  fi
+
+  if [ "$COPY" -eq 1 ]; then
+    verb=copied
+  else
+    verb=moved
+  fi
+
+  printf 'done: session %s %s from %s to %s\n' "$ID" "$verb" "$SOURCE_LABEL" "$TARGET_LABEL"
+}
+
+main "$@"
