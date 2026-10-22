@@ -136,6 +136,9 @@ $HOME/games/.codex/session_index.jsonl
   - 可用 `--no-history` 完全跳過。
   - 若來源或目的地的 `history.jsonl` 格式損壞，會警告並跳過歷史搬移，
     不影響 rollout 檔案與索引的搬移。
+- **補搬已移到目的地的歷史**：若 rollout 檔案已經在目的地，但另一個
+  `CODEX_HOME` 的 `history.jsonl` 還有此工作階段，會自動只合併歷史，不搬移
+  rollout 檔案或索引。
 - **目的地衝突保護**：目的地已有同名檔案或索引時，預設直接中止，不會默默覆蓋。
 - **`--force` 備份機制**：強制覆蓋前會建立 `.bak.<timestamp>` 備份。
 - **`--copy` 模式**：只複製、不刪除來源，適合先備份或平行測試。
@@ -252,6 +255,11 @@ rollout 檔案是工作階段的內容本體，而 `session_index.jsonl` 則是 
 `history.jsonl` 不是工作階段本體，沒有它通常不影響 rollout 檔案載入；但若希望
 Codex 的提示詞回顧功能也保持一致，建議保留預設的歷史搬移。若你只想搬 rollout 檔案
 與索引，請加上 `--no-history`。
+
+若 rollout 檔案已經在目的地，而另一個 `CODEX_HOME` 的 `history.jsonl` 還有此工作
+階段的資料，工具會自動進入「只補搬歷史」模式：只合併 `history.jsonl`，不會搬移
+rollout 檔案或 `session_index.jsonl`。這適合修正先前只搬了工作階段本體、忘記搬歷史
+的情況。
 
 ---
 
@@ -460,6 +468,21 @@ codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 home --copy
 codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 home --no-history
 ```
 
+#### rollout 已在目的地，只補搬提示詞歷史
+
+```bash
+codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 home --dry-run
+```
+
+若目的地已有 rollout 檔案，來源只剩歷史資料，輸出會類似：
+
+```text
+[dry-run] mode:    move (history only)
+[dry-run] history: merge 27 source entry/entries into 1 destination entry/entries; remove source entries
+```
+
+這種情況不會搬移 rollout 檔案或 `session_index.jsonl`。
+
 #### 目的地已有相同工作階段時強制覆蓋
 
 ```bash
@@ -561,6 +584,21 @@ sessions/2026/10/22/rollout-...jsonl
 歷史資料是「合併」而不是「取代」。即使使用 `--force`，目的地獨有的提示詞也不會被
 刪除；`--force` 只會在有既有歷史時額外建立 `.bak.<timestamp>` 備份。
 
+### 只補搬 `history.jsonl`
+
+若指定的目的地已經有該工作階段的 rollout 檔案，但另一個 `CODEX_HOME` 的
+`history.jsonl` 還有此工作階段，工具會自動進入 history-only 模式：
+
+- 只讀取並合併來源 `history.jsonl`。
+- 不搬移 rollout 檔案。
+- 不修改來源或目的地的 `session_index.jsonl`。
+- `--copy` 會保留來源歷史。
+- 若多個非目的地環境都有此工作階段的歷史，會要求使用 `--from` 指定來源。
+- `--no-history` 會停用此模式；此時若沒有 rollout 檔案可搬，仍會依照原本的規則
+  顯示錯誤。
+
+這個模式適合修正「rollout 已經搬過去，但 `history.jsonl` 還留在另一邊」的情況。
+
 ### 衝突與 `--force`
 
 下列情況會被視為目的地衝突：
@@ -594,6 +632,9 @@ sessions/2026/10/22/rollout-...jsonl
 - `history.jsonl` 會從暫存備份還原；若本次才建立，則會移除。
 - 索引會從暫存備份還原。
 - `--force` 覆蓋的檔案會從 `.bak.<timestamp>` 備份還原。
+
+> 若進入 history-only 模式，只會執行歷史合併與來源移除，rollout 檔案與索引不會
+> 變動。
 
 > 回復是「盡力而為」。仍建議在重要環境中先使用 `--dry-run`，並在搬移前確認 Codex
 > 已關閉。
@@ -792,6 +833,8 @@ rm -rf "$tmp"
 - `--copy` 是否保留來源檔案、索引與歷史。
 - `--no-history` 是否完全不修改兩邊的 `history.jsonl`。
 - `history.jsonl` 格式損壞時，是否只警告並跳過歷史，rollout 檔案仍完成搬移。
+- rollout 已在目的地時，是否只補搬 `history.jsonl`，且不改動 rollout 與索引。
+- 多個來源都有此工作階段歷史時，是否要求使用 `--from`。
 - 日期目錄是否被正確清理。
 
 ### 安裝腳本測試
@@ -934,6 +977,21 @@ jq . ~/.codex/history.jsonl >/dev/null
 ```bash
 jq -c 'select(.session_id == "<session-id>")' ~/games/.codex/history.jsonl
 jq -c 'select(.session_id == "<session-id>")' ~/.codex/history.jsonl
+```
+
+### rollout 已在目的地，只想補搬 `history.jsonl`
+
+直接指定目的地即可，工具會自動偵測並進入 history-only 模式：
+
+```bash
+codex-move-session <session-id> home --dry-run
+codex-move-session <session-id> home
+```
+
+若多個非目的地環境都有此工作階段的歷史，請加上 `--from`：
+
+```bash
+codex-move-session <session-id> home --from pro500
 ```
 
 ### 搬移後 Codex 選單沒有出現工作階段

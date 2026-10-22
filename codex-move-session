@@ -20,6 +20,7 @@ COPY=0
 DRY_RUN=0
 FORCE=0
 MIGRATE_HISTORY=1
+HISTORY_ONLY=0
 FROM_ARG=""
 ID=""
 TARGET_ARG=""
@@ -110,6 +111,7 @@ Notes:
   - Moves matching session_index.jsonl lines and deduplicates by session id.
   - Merges matching history.jsonl prompt-history lines by default; use
     --no-history to skip. History is deduplicated and sorted by timestamp.
+  - If the rollout is already in the destination, only history.jsonl is migrated.
   - state_5.sqlite and thread_history_1.sqlite are not changed.
   - Close Codex before running to avoid concurrent index or history writes.
   - If the destination picker does not show the session, run:
@@ -301,12 +303,12 @@ abort_after_files() {
 }
 
 ensure_target_layout() {
-  if [ ! -d "$TARGET_HOME/sessions" ]; then
+  if [ "$HISTORY_ONLY" -eq 0 ] && [ ! -d "$TARGET_HOME/sessions" ]; then
     warn "creating destination sessions directory: $TARGET_HOME/sessions"
     mkdir -p -- "$TARGET_HOME/sessions" || die "cannot create $TARGET_HOME/sessions"
   fi
 
-  if [ ! -f "$DST_INDEX" ]; then
+  if [ "$HISTORY_ONLY" -eq 0 ] && [ ! -f "$DST_INDEX" ]; then
     warn "creating empty destination session index: $DST_INDEX"
     : >"$DST_INDEX" || die "cannot create $DST_INDEX"
     chmod 644 "$DST_INDEX" 2>/dev/null || true
@@ -422,21 +424,27 @@ print_plan() {
   printf '[dry-run] session: %s\n' "$ID"
   printf '[dry-run] from:    %s (%s)\n' "$SOURCE_LABEL" "$SOURCE_HOME"
   printf '[dry-run] to:      %s (%s)\n' "$TARGET_LABEL" "$TARGET_HOME"
-  printf '[dry-run] mode:    %s\n' "$verb"
+  if [ "$HISTORY_ONLY" -eq 1 ]; then
+    printf '[dry-run] mode:    %s (history only)\n' "$verb"
+  else
+    printf '[dry-run] mode:    %s\n' "$verb"
+  fi
 
-  for f in "${SRC_FILES[@]}"; do
+  for f in ${SRC_FILES[@]+"${SRC_FILES[@]}"}; do
     rel=${f#"$SOURCE_HOME"/}
     printf '[dry-run] %s %s -> %s\n' "$verb" "$f" "$TARGET_HOME/$rel"
   done
 
-  if [ "$SRC_COUNT" -gt 0 ]; then
-    if [ "$COPY" -eq 1 ]; then
-      printf '[dry-run] index:   keep %s source entry/entries; add 1 destination entry\n' "$SRC_COUNT"
+  if [ "$HISTORY_ONLY" -eq 0 ]; then
+    if [ "$SRC_COUNT" -gt 0 ]; then
+      if [ "$COPY" -eq 1 ]; then
+        printf '[dry-run] index:   keep %s source entry/entries; add 1 destination entry\n' "$SRC_COUNT"
+      else
+        printf '[dry-run] index:   remove %s source entry/entries; add 1 destination entry\n' "$SRC_COUNT"
+      fi
     else
-      printf '[dry-run] index:   remove %s source entry/entries; add 1 destination entry\n' "$SRC_COUNT"
+      printf '[dry-run] index:   no source entry found; index files would not change\n'
     fi
-  else
-    printf '[dry-run] index:   no source entry found; index files would not change\n'
   fi
 
   case "$HISTORY_STATUS" in
@@ -467,7 +475,7 @@ print_plan() {
   esac
 
   if [ "$FORCE" -eq 1 ]; then
-    for f in "${SRC_FILES[@]}"; do
+    for f in ${SRC_FILES[@]+"${SRC_FILES[@]}"}; do
       rel=${f#"$SOURCE_HOME"/}
       dst="$TARGET_HOME/$rel"
       if [ -e "$dst" ]; then
@@ -566,6 +574,7 @@ main() {
   local auto_count
   local ambiguous
   local index_only
+  local target_has_files
   local conflicts
   local f
   local rel
@@ -576,6 +585,8 @@ main() {
   local after
   local auto_names=()
   local auto_homes=()
+  local history_names=()
+  local history_homes=()
 
   parse_args "$@"
 
@@ -602,7 +613,18 @@ main() {
 
     discover_files "$SOURCE_HOME"
     if [ ${#SRC_FILES[@]} -eq 0 ]; then
-      die "no rollout files found for $ID under $SOURCE_HOME"
+      if [ "$MIGRATE_HISTORY" -eq 1 ] && [ -f "$SOURCE_HOME/history.jsonl" ]; then
+        discover_files "$TARGET_HOME"
+        if [ ${#SRC_FILES[@]} -gt 0 ]; then
+          HISTORY_ONLY=1
+          SRC_FILES=()
+          note "no rollout files for $ID in $SOURCE_HOME; migrating history only because the destination already has the rollout"
+        else
+          die "no rollout files found for $ID under $SOURCE_HOME or $TARGET_HOME"
+        fi
+      else
+        die "no rollout files found for $ID under $SOURCE_HOME"
+      fi
     fi
     SOURCE_LABEL=$(home_label "$SOURCE_HOME")
   else
@@ -636,13 +658,53 @@ main() {
       die "session found in multiple CODEX_HOMEs (${auto_names[*]}); use --from home|pro500"
     fi
 
-    if [ "$auto_count" -eq 0 ]; then
+    if [ "$auto_count" -eq 0 ] && [ "$MIGRATE_HISTORY" -eq 1 ]; then
+      discover_files "$TARGET_HOME"
+      target_has_files=${#SRC_FILES[@]}
+      SRC_FILES=()
+
+      if [ "$target_has_files" -gt 0 ]; then
+        for alias in home pro500; do
+          if [ "$alias" = home ]; then
+            h=$ALIAS_HOME
+          else
+            h=$ALIAS_PRO500
+          fi
+          h=$(canonical_dir "$h" 2>/dev/null) || continue
+          if [ "$h" = "$TARGET_HOME" ]; then
+            continue
+          fi
+          if [ -f "$h/history.jsonl" ] &&
+            [ "$(count_history_entries "$h/history.jsonl")" -gt 0 ]; then
+            history_names+=("$alias")
+            history_homes+=("$h")
+          fi
+        done
+
+        if [ ${#history_names[@]} -gt 1 ]; then
+          die "session history found in multiple CODEX_HOMEs (${history_names[*]}); use --from home|pro500"
+        fi
+
+        if [ ${#history_names[@]} -eq 1 ]; then
+          SOURCE_HOME=${history_homes[0]}
+          SOURCE_LABEL=${history_names[0]}
+          HISTORY_ONLY=1
+          SRC_FILES=()
+        fi
+      fi
+    fi
+
+    if [ "$auto_count" -eq 0 ] && [ "$HISTORY_ONLY" -eq 0 ]; then
       index_only=""
       for alias in home pro500; do
         if [ "$alias" = home ]; then
           h=$ALIAS_HOME
         else
           h=$ALIAS_PRO500
+        fi
+        h=$(canonical_dir "$h" 2>/dev/null) || continue
+        if [ "$h" = "$TARGET_HOME" ]; then
+          continue
         fi
         if [ -f "$h/session_index.jsonl" ] &&
           jq -e --arg id "$ID" 'select(.id == $id)' "$h/session_index.jsonl" >/dev/null 2>&1; then
@@ -656,9 +718,11 @@ main() {
       die "no rollout files found for $ID under home or pro500"
     fi
 
-    SOURCE_HOME=${auto_homes[0]}
-    SOURCE_LABEL=${auto_names[0]}
-    discover_files "$SOURCE_HOME"
+    if [ "$HISTORY_ONLY" -eq 0 ]; then
+      SOURCE_HOME=${auto_homes[0]}
+      SOURCE_LABEL=${auto_names[0]}
+      discover_files "$SOURCE_HOME"
+    fi
   fi
 
   SRC_INDEX="$SOURCE_HOME/session_index.jsonl"
@@ -666,32 +730,38 @@ main() {
   SRC_HISTORY="$SOURCE_HOME/history.jsonl"
   DST_HISTORY="$TARGET_HOME/history.jsonl"
 
-  if [ -f "$SRC_INDEX" ]; then
-    validate_index "$SRC_INDEX" ||
-      die "source session index is not valid JSONL: $SRC_INDEX"
-  else
-    warn "source session index not found: $SRC_INDEX"
-  fi
+  if [ "$HISTORY_ONLY" -eq 0 ]; then
+    if [ -f "$SRC_INDEX" ]; then
+      validate_index "$SRC_INDEX" ||
+        die "source session index is not valid JSONL: $SRC_INDEX"
+    else
+      warn "source session index not found: $SRC_INDEX"
+    fi
 
-  if [ -f "$DST_INDEX" ]; then
-    validate_index "$DST_INDEX" ||
-      die "destination session index is not valid JSONL: $DST_INDEX"
-  fi
+    if [ -f "$DST_INDEX" ]; then
+      validate_index "$DST_INDEX" ||
+        die "destination session index is not valid JSONL: $DST_INDEX"
+    fi
 
-  SRC_COUNT=$(count_id_entries "$SRC_INDEX")
-  DST_COUNT=$(count_id_entries "$DST_INDEX")
+    SRC_COUNT=$(count_id_entries "$SRC_INDEX")
+    DST_COUNT=$(count_id_entries "$DST_INDEX")
 
-  if [ "$SRC_COUNT" -gt 1 ]; then
-    warn "source session index has $SRC_COUNT entries for $ID; keeping the newest updated_at entry"
-  fi
+    if [ "$SRC_COUNT" -gt 1 ]; then
+      warn "source session index has $SRC_COUNT entries for $ID; keeping the newest updated_at entry"
+    fi
 
-  if [ "$SRC_COUNT" -gt 0 ]; then
-    CANONICAL=$(canonical_entry "$SRC_INDEX")
-    if [ -z "$CANONICAL" ]; then
-      warn "could not read a session index entry for $ID; indexes will not be changed"
+    if [ "$SRC_COUNT" -gt 0 ]; then
+      CANONICAL=$(canonical_entry "$SRC_INDEX")
+      if [ -z "$CANONICAL" ]; then
+        warn "could not read a session index entry for $ID; indexes will not be changed"
+      fi
+    else
+      warn "no session_index entry found for $ID in source; only rollout files will be moved"
     fi
   else
-    warn "no session_index entry found for $ID in source; only rollout files will be moved"
+    SRC_COUNT=0
+    DST_COUNT=0
+    CANONICAL=""
   fi
 
   if [ "$MIGRATE_HISTORY" -eq 0 ]; then
@@ -717,8 +787,31 @@ main() {
     fi
   fi
 
+  if [ "$HISTORY_ONLY" -eq 1 ] && [ "$HISTORY_STATUS" != enabled ]; then
+    case "$HISTORY_STATUS" in
+      missing)
+        die "cannot migrate history: no source history.jsonl for $ID under $SOURCE_HOME"
+        ;;
+      empty)
+        die "cannot migrate history: no history entries for $ID under $SOURCE_HOME"
+        ;;
+      invalid-source)
+        die "cannot migrate history: source history.jsonl is not valid JSONL"
+        ;;
+      invalid-destination)
+        die "cannot migrate history: destination history.jsonl is not valid JSONL"
+        ;;
+      disabled)
+        die "cannot migrate history: --no-history was specified"
+        ;;
+      *)
+        die "cannot migrate history (status: $HISTORY_STATUS)"
+        ;;
+    esac
+  fi
+
   conflicts=()
-  for f in "${SRC_FILES[@]}"; do
+  for f in ${SRC_FILES[@]+"${SRC_FILES[@]}"}; do
     rel=${f#"$SOURCE_HOME"/}
     dst="$TARGET_HOME/$rel"
     if [ -e "$dst" ]; then
@@ -743,10 +836,10 @@ main() {
   fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    if [ ! -d "$TARGET_HOME/sessions" ]; then
+    if [ "$HISTORY_ONLY" -eq 0 ] && [ ! -d "$TARGET_HOME/sessions" ]; then
       warn "destination sessions directory does not exist (would create): $TARGET_HOME/sessions"
     fi
-    if [ ! -f "$DST_INDEX" ]; then
+    if [ "$HISTORY_ONLY" -eq 0 ] && [ ! -f "$DST_INDEX" ]; then
       warn "destination session index does not exist (would create): $DST_INDEX"
     fi
     if [ "$HISTORY_STATUS" = enabled ] && [ ! -f "$DST_HISTORY" ]; then
@@ -758,7 +851,12 @@ main() {
 
   ensure_target_layout
 
-  if [ -f "$DST_INDEX" ]; then
+  if [ "$HISTORY_ONLY" -eq 1 ]; then
+    printf 'history-only: rollout for %s is already in %s; no files or index will be moved\n' \
+      "$ID" "$TARGET_LABEL"
+  fi
+
+  if [ "$HISTORY_ONLY" -eq 0 ] && [ -f "$DST_INDEX" ]; then
     DST_INDEX_BAK=$(mktemp "${TMPDIR:-/tmp}/codex-dst-index.XXXXXX") ||
       die "cannot create a temporary destination index backup"
     TMP_FILES+=("$DST_INDEX_BAK")
@@ -810,7 +908,7 @@ main() {
     verb=move
   fi
 
-  for f in "${SRC_FILES[@]}"; do
+  for f in ${SRC_FILES[@]+"${SRC_FILES[@]}"}; do
     rel=${f#"$SOURCE_HOME"/}
     dst="$TARGET_HOME/$rel"
 
@@ -907,7 +1005,7 @@ main() {
 
   if [ "$COPY" -eq 0 ]; then
     sessions_root="$SOURCE_HOME/sessions"
-    for f in "${SRC_FILES[@]}"; do
+    for f in ${SRC_FILES[@]+"${SRC_FILES[@]}"}; do
       d=$(dirname "$f")
       while [ "$d" != "$sessions_root" ] && [ "$d" != "/" ]; do
         if [[ "$d" != "$sessions_root"/* ]]; then
@@ -950,7 +1048,12 @@ main() {
     verb=moved
   fi
 
-  printf 'done: session %s %s from %s to %s\n' "$ID" "$verb" "$SOURCE_LABEL" "$TARGET_LABEL"
+  if [ "$HISTORY_ONLY" -eq 1 ]; then
+    printf 'done: history for session %s %s from %s to %s (rollout already in destination)\n' \
+      "$ID" "$verb" "$SOURCE_LABEL" "$TARGET_LABEL"
+  else
+    printf 'done: session %s %s from %s to %s\n' "$ID" "$verb" "$SOURCE_LABEL" "$TARGET_LABEL"
+  fi
 }
 
 main "$@"
