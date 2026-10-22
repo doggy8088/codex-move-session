@@ -5,10 +5,12 @@
 `codex-move-session` 是一個用 Bash 寫成的命令列工具，用來在兩個不同的
 OpenAI Codex CLI `CODEX_HOME` 目錄之間搬移指定的工作階段（session）。
 
-它會同時處理兩個最容易漏掉、也最容易造成資料不一致的地方：
+它會同時處理三個最容易漏掉、也最容易造成資料不一致的地方：
 
 1. `sessions/YYYY/MM/DD/` 底下的 rollout 工作階段檔案。
 2. `session_index.jsonl` 裡面對應的工作階段索引資料。
+3. `history.jsonl` 裡面對應的提示詞歷史（預設一併合併；可用 `--no-history`
+   跳過）。
 
 本工具預設支援兩個具名別名：
 
@@ -104,9 +106,11 @@ $HOME/games/.codex/session_index.jsonl
 1. 把 rollout 檔案搬到 `$HOME/.codex/sessions/2026/10/22/`。
 2. 把索引資料從 `$HOME/games/.codex/session_index.jsonl` 移到
    `$HOME/.codex/session_index.jsonl`。
+3. （預設）把 `history.jsonl` 中此工作階段的提示詞歷史合併到
+   `$HOME/.codex/history.jsonl`，並從來源移除。
 
-本工具會自動完成上述兩件事，並且處理 fork 檔案、壓縮檔案、重複索引、目的地衝突與
-失敗回復等情況。
+本工具會自動完成上述三件事，並且處理 fork 檔案、壓縮檔案、重複索引、歷史合併、
+目的地衝突與失敗回復等情況。若不想搬移提示詞歷史，可加上 `--no-history`。
 
 ---
 
@@ -124,6 +128,14 @@ $HOME/games/.codex/session_index.jsonl
   - 自動去除同一個 ID 的重複索引。
   - 保留 `updated_at` 最新的那一筆。
   - 以原子性方式改寫索引檔，避免寫到一半損壞。
+- **同步處理 `history.jsonl`（預設）**：
+  - 取出 `session_id` 等於指定 UUID 的提示詞歷史。
+  - 與目的地同工作階段的歷史合併，不會刪掉目的地獨有的資料。
+  - 去除完全相同的重複資料，並依 `ts` 遞增排序。
+  - 搬移模式會從來源移除對應歷史；`--copy` 會保留來源。
+  - 可用 `--no-history` 完全跳過。
+  - 若來源或目的地的 `history.jsonl` 格式損壞，會警告並跳過歷史搬移，
+    不影響 rollout 檔案與索引的搬移。
 - **目的地衝突保護**：目的地已有同名檔案或索引時，預設直接中止，不會默默覆蓋。
 - **`--force` 備份機制**：強制覆蓋前會建立 `.bak.<timestamp>` 備份。
 - **`--copy` 模式**：只複製、不刪除來源，適合先備份或平行測試。
@@ -212,6 +224,34 @@ rollout-2026-10-20T14-34-00-01a157bc-4d80-74f0-bdad-8785b1314125_01a15804-52f7-7
 rollout 檔案是工作階段的內容本體，而 `session_index.jsonl` 則是 Codex 用來列出、
 辨識與排序工作階段的索引。只搬檔案時，Codex 可能無法在選單中正確顯示該工作階段；
 只搬索引時，則會留下指向不存在檔案的無效資料。兩者必須一起處理。
+
+### `history.jsonl`
+
+`history.jsonl` 用來儲存提示詞歷史，每一行都是一個 JSON 物件，例如：
+
+```json
+{"session_id":"01a15f36-8e5e-7901-86d9-13b7e1100393","ts":1790779341,"text":"幫我整理這段程式碼"}
+```
+
+常見欄位：
+
+| 欄位 | 說明 |
+| --- | --- |
+| `session_id` | 所屬工作階段的 UUID |
+| `ts` | 提示詞建立的 Unix epoch 秒數 |
+| `text` | 提示詞內容 |
+
+同一個工作階段可能有多筆歷史，而且來源與目的地可能都已經有部分資料。本工具預設會：
+
+1. 只取出 `session_id` 與指定 UUID 完全相同的行。
+2. 把來源與目的地同工作階段的資料合併，不會刪除目的地獨有的提示詞。
+3. 去除完全相同的重複物件。
+4. 將合併後的 `history.jsonl` 依 `ts` 遞增排序。
+5. 搬移模式下從來源移除該工作階段的歷史；`--copy` 則保留來源。
+
+`history.jsonl` 不是工作階段本體，沒有它通常不影響 rollout 檔案載入；但若希望
+Codex 的提示詞回顧功能也保持一致，建議保留預設的歷史搬移。若你只想搬 rollout 檔案
+與索引，請加上 `--no-history`。
 
 ---
 
@@ -368,9 +408,11 @@ codex-move-session <session-id> <target> [options]
 | 選項 | 說明 |
 | --- | --- |
 | `--from <alias\|path>` | 明確指定來源，常用於來源同時存在於多個環境時 |
-| `--copy` | 只複製，不刪除來源檔案與來源索引 |
+| `--copy` | 只複製，不刪除來源檔案、索引與歷史 |
 | `--dry-run` | 只顯示預計動作，不做任何變更 |
 | `--force` | 允許覆蓋目的地已有的工作階段；覆蓋前會建立備份 |
+| `--with-history` | 搬移 `history.jsonl` 提示詞歷史（預設） |
+| `--no-history` | 跳過 `history.jsonl`，只搬 rollout 檔案與索引 |
 | `-v`, `--version` | 顯示版本 |
 | `-h`, `--help` | 顯示說明 |
 
@@ -391,6 +433,7 @@ codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 home --dry-run
 [dry-run] mode:    move
 [dry-run] move /Users/will/games/.codex/sessions/2026/10/22/rollout-2026-10-22T00-06-13-01a15f36-8e5e-7901-86d9-13b7e1100393.jsonl -> /Users/will/.codex/sessions/2026/10/22/rollout-2026-10-22T00-06-13-01a15f36-8e5e-7901-86d9-13b7e1100393.jsonl
 [dry-run] index:   remove 1 source entry/entries; add 1 destination entry
+[dry-run] history: merge 27 source entry/entries into 1 destination entry/entries; remove source entries
 ```
 
 #### 從 `pro500` 搬到 `home`
@@ -411,6 +454,12 @@ codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 pro500
 codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 home --copy
 ```
 
+#### 只搬 rollout 檔案與索引，不搬提示詞歷史
+
+```bash
+codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 home --no-history
+```
+
 #### 目的地已有相同工作階段時強制覆蓋
 
 ```bash
@@ -422,7 +471,10 @@ codex-move-session 01a15f36-8e5e-7901-86d9-13b7e1100393 home --force
 - 備份目的地已被覆蓋的 rollout 檔案為 `<原檔名>.bak.<timestamp>`。
 - 備份目的地的 `session_index.jsonl` 為
   `session_index.jsonl.bak.<timestamp>`。
+- 若目的地 `history.jsonl` 已有同工作階段的歷史，備份為
+  `history.jsonl.bak.<timestamp>`。
 - 以來源的最新索引資料取代目的地同 ID 的索引資料。
+- 歷史資料仍採合併方式處理，不會刪除目的地獨有的提示詞。
 
 #### 明確指定來源
 
@@ -491,6 +543,24 @@ sessions/2026/10/22/rollout-...jsonl
 若來源索引檔不存在，或找不到對應 ID，工具會警告並只搬移 rollout 檔案；這種情況通常
 表示索引本來就不完整，工具不會自行捏造資料。
 
+### `history.jsonl` 的處理
+
+1. 從來源 `history.jsonl` 找出所有 `session_id` 等於指定 UUID 的行。
+2. 同時讀取目的地 `history.jsonl` 中同工作階段的資料。
+3. 將兩邊資料合併，不刪除目的地獨有的提示詞。
+4. 去除完全相同的重複 JSON 物件。
+5. 依 `ts` 遞增排序；缺少 `ts` 或無法轉成數字時視為 `0`。
+6. 以暫存檔加 `mv` 的方式原子性替換目的地檔案。
+7. 搬移模式下再從來源 `history.jsonl` 移除該工作階段的資料；`--copy` 不會移除。
+8. 若目的地原本沒有 `history.jsonl`，會自動建立。
+
+若來源沒有 `history.jsonl`，或檔案中沒有此工作階段的資料，工具會顯示跳過訊息，
+不會因此失敗。若來源或目的地的 `history.jsonl` 不是合法 JSONL，工具會警告並跳過
+歷史搬移，rollout 檔案與索引仍會照常處理。
+
+歷史資料是「合併」而不是「取代」。即使使用 `--force`，目的地獨有的提示詞也不會被
+刪除；`--force` 只會在有既有歷史時額外建立 `.bak.<timestamp>` 備份。
+
 ### 衝突與 `--force`
 
 下列情況會被視為目的地衝突：
@@ -500,22 +570,28 @@ sessions/2026/10/22/rollout-...jsonl
 
 預設行為是**中止**，並列出所有衝突項目。只有加上 `--force` 才會覆蓋。
 
+`history.jsonl` 已有同工作階段的資料**不算衝突**，因為歷史資料採合併處理，不會覆蓋
+目的地獨有的提示詞。若加上 `--force`，工具仍會在有既有歷史時建立備份。
+
 ### 交易與回復
 
 工具會盡量以「先檢查、後執行、失敗回復」的方式運作：
 
-1. 先驗證 UUID、來源、目的地與索引格式。
+1. 先驗證 UUID、來源、目的地、索引與歷史格式。
 2. 檢查所有目的地衝突。
-3. 建立索引的暫存備份。
-4. 搬移或複製檔案。
-5. 更新目的地索引。
-6. 更新來源索引。
-7. 驗證結果。
+3. 建立索引與歷史的暫存備份。
+4. 搬移或複製 rollout 檔案。
+5. 合併目的地的 `history.jsonl`。
+6. 從來源 `history.jsonl` 移除對應資料（`--copy` 略過）。
+7. 更新目的地索引。
+8. 更新來源索引。
+9. 驗證結果。
 
 若中途失敗：
 
 - 已搬移的檔案會嘗試搬回來源位置。
 - 複製模式下，已複製的目的地檔案會被移除。
+- `history.jsonl` 會從暫存備份還原；若本次才建立，則會移除。
 - 索引會從暫存備份還原。
 - `--force` 覆蓋的檔案會從 `.bak.<timestamp>` 備份還原。
 
@@ -541,30 +617,39 @@ sessions/2026/
 
 - **先預覽**：一律建議先執行 `--dry-run`。
 - **關閉 Codex**：搬移期間請關閉 Codex，避免 Codex 同時寫入
-  `session_index.jsonl`。
+  `session_index.jsonl` 或 `history.jsonl`。
 - **使用 `--force` 前先確認**：強制覆蓋會建立備份，但仍可能造成目的地版本與你預期的
   不同。
+- **歷史資料採合併**：`history.jsonl` 不會刪除目的地獨有的提示詞；若不想搬移歷史，
+  請加上 `--no-history`。
 - **備份整個 `CODEX_HOME`**：若工作階段非常重要，建議先額外備份整個目錄。
-- **不要在搬移途中中斷行程**：若終端機被強制關閉，請檢查來源與目的地的 rollout 檔案
-  及索引是否一致。
-- **索引格式必須正確**：工具會在搬移前驗證 JSONL；若索引已損壞，會中止而不繼續。
+- **不要在搬移途中中斷行程**：若終端機被強制關閉，請檢查來源與目的地的 rollout 檔案、
+  索引與歷史是否一致。
+- **索引格式必須正確**：工具會在搬移前驗證 `session_index.jsonl`；若索引已損壞，會
+  中止而不繼續。
+- **歷史格式損壞時會跳過**：若 `history.jsonl` 無法解析，工具會警告並跳過歷史搬移，
+  rollout 檔案與索引仍會處理。
 
 ---
 
 ## 與 Codex SQLite 資料庫的關係
 
-本工具**只處理** rollout 檔案與 `session_index.jsonl`，不會修改下列資料：
+本工具**只處理** rollout 檔案、`session_index.jsonl` 與 `history.jsonl`，不會修改
+下列資料：
 
-- `history.jsonl`：提示詞歷史。
 - `state_5.sqlite`：Codex 的本機狀態資料庫。
 - `thread_history_1.sqlite`：分頁式工作階段歷史資料庫。
 - 其他 SQLite、快取、設定或外掛資料。
+
+`history.jsonl` 只是逐行的提示詞歷史，不是工作階段資料庫；工具會以 JSONL 方式
+合併與去重，不會碰觸 SQLite 的交易或 schema。
 
 這是刻意的設計取捨：
 
 - SQLite 資料庫涉及 WAL、交易、版本遷移與並行寫入，直接修改風險較高。
 - 不同 Codex 版本的資料表結構可能不同。
-- 只搬移檔案與索引已能滿足大多數「把工作階段搬到另一個 `CODEX_HOME`」的需求。
+- 只搬移 rollout 檔案、索引與提示詞歷史，已能滿足大多數「把工作階段搬到另一個
+  `CODEX_HOME`」的需求。
 
 若搬移後 Codex 的選單沒有顯示該工作階段，可以嘗試：
 
@@ -627,6 +712,25 @@ codex-move-session v0.1.0
 > 只有版本號有變更且 tag 尚不存在時，才會建立新的 Release。單純推送一般 commit
 > 不會重複發行。
 
+### 重新發行同一個版本
+
+Workflow 只檢查 `v<version>` tag 是否存在，不會比較版本內容。若需要修正同一個版本的
+Release 資產（例如補上 `history.jsonl` 搬移功能），必須先刪除現有的 GitHub Release
+與 tag，再推送一個新 commit 讓 workflow 重新執行：
+
+```bash
+gh release delete v0.1.0 \
+  --repo doggy8088/codex-move-session \
+  --yes \
+  --cleanup-tag
+
+git commit --allow-empty -m "chore: re-release v0.1.0"
+git push origin main
+```
+
+> `--cleanup-tag` 會一併刪除遠端 tag。若只刪 Release 而沒有刪 tag，workflow 仍會
+> 判定 tag 已存在而跳過發行。
+
 ---
 
 ## 開發與測試
@@ -675,13 +779,19 @@ HOME="$tmp/home" ./codex-move-session --help
 rm -rf "$tmp"
 ```
 
-若要測試完整搬移流程，請在暫存環境中建立假的 rollout JSONL 與索引資料，再執行
-`codex-move-session <id> home`，並檢查：
+若要測試完整搬移流程，請在暫存環境中建立假的 rollout JSONL、索引資料與
+`history.jsonl`，再執行 `codex-move-session <id> home`，並檢查：
 
 - 來源檔案是否被移除。
 - 目的地檔案是否存在。
 - 來源索引是否移除對應 ID。
 - 目的地索引是否只保留一筆。
+- 目的地 `history.jsonl` 是否包含來源與目的地兩邊的提示詞。
+- 重複的歷史物件是否只保留一筆，且依 `ts` 排序。
+- 搬移模式下來源 `history.jsonl` 是否已移除該工作階段。
+- `--copy` 是否保留來源檔案、索引與歷史。
+- `--no-history` 是否完全不修改兩邊的 `history.jsonl`。
+- `history.jsonl` 格式損壞時，是否只警告並跳過歷史，rollout 檔案仍完成搬移。
 - 日期目錄是否被正確清理。
 
 ### 安裝腳本測試
@@ -791,6 +901,40 @@ jq . ~/.codex/session_index.jsonl >/dev/null
 ```
 
 若無法解析，請手動修復或從備份還原後再執行。
+
+### `history.jsonl` 格式損壞
+
+若看到類似訊息：
+
+```text
+warning: source history.jsonl is not valid JSONL; history will not be migrated
+history: skipped (invalid source JSONL)
+```
+
+表示提示詞歷史無法解析。工具會跳過歷史搬移，但 rollout 檔案與索引仍會完成。請先
+備份並檢查：
+
+```bash
+jq . ~/.codex/history.jsonl >/dev/null
+```
+
+修復後可重新執行，或加上 `--no-history` 明確跳過歷史。
+
+### `history.jsonl` 沒有搬移
+
+可能原因：
+
+- 使用了 `--no-history`。
+- 來源沒有 `history.jsonl`。
+- 來源檔案中沒有此 `session_id` 的資料。
+- 來源或目的地的 `history.jsonl` 格式損壞，工具已警告並跳過。
+
+可先用 `jq` 確認：
+
+```bash
+jq -c 'select(.session_id == "<session-id>")' ~/games/.codex/history.jsonl
+jq -c 'select(.session_id == "<session-id>")' ~/.codex/history.jsonl
+```
 
 ### 搬移後 Codex 選單沒有出現工作階段
 

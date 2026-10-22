@@ -3,6 +3,7 @@
 # codex-move-session
 #
 # Move a Codex CLI session between two CODEX_HOME directories.
+# Handles rollout files, session_index.jsonl, and history.jsonl.
 # The alias table is intentionally small and easy to edit.
 #
 #   home   -> $HOME/.codex
@@ -18,6 +19,7 @@ ALIAS_PRO500="$HOME/games/.codex"
 COPY=0
 DRY_RUN=0
 FORCE=0
+MIGRATE_HISTORY=1
 FROM_ARG=""
 ID=""
 TARGET_ARG=""
@@ -27,13 +29,21 @@ SOURCE_HOME=""
 SOURCE_LABEL=""
 SRC_INDEX=""
 DST_INDEX=""
+SRC_HISTORY=""
+DST_HISTORY=""
 CANONICAL=""
 SRC_COUNT=0
 DST_COUNT=0
+SRC_HISTORY_COUNT=0
+DST_HISTORY_COUNT=0
+HISTORY_STATUS="disabled"
 STAMP=""
 DST_INDEX_CREATED=0
+DST_HISTORY_CREATED=0
 DST_INDEX_BAK=""
 SRC_INDEX_BAK=""
+DST_HISTORY_BAK=""
+SRC_HISTORY_BAK=""
 
 SRC_FILES=()
 MOVED_SRC=()
@@ -61,6 +71,10 @@ warn() {
   printf 'warning: %s\n' "$*" >&2
 }
 
+note() {
+  printf 'note: %s\n' "$*" >&2
+}
+
 show_version() {
   printf 'codex-move-session v%s\n' "$VERSION"
 }
@@ -77,9 +91,11 @@ Targets:
 
 Options:
   --from <alias|path>  Explicit source (when auto-detection is ambiguous)
-  --copy               Copy instead of move; leave source files/index intact
+  --copy               Copy instead of move; leave source files/index/history intact
   --dry-run            Show what would happen without changing anything
   --force              Replace an existing destination copy; backs up files
+  --with-history       Migrate history.jsonl prompt history (default)
+  --no-history         Skip history.jsonl prompt-history migration
   -v, --version        Show version
   -h, --help           Show this help
 
@@ -92,8 +108,10 @@ Notes:
   - Moves rollout-*.jsonl and rollout-*.jsonl.zst files, including fork files
     named rollout-*-<session-id>_<fork-id>.jsonl.
   - Moves matching session_index.jsonl lines and deduplicates by session id.
-  - history.jsonl, state_5.sqlite, and thread_history_1.sqlite are not changed.
-  - Close Codex before running to avoid concurrent index writes.
+  - Merges matching history.jsonl prompt-history lines by default; use
+    --no-history to skip. History is deduplicated and sorted by timestamp.
+  - state_5.sqlite and thread_history_1.sqlite are not changed.
+  - Close Codex before running to avoid concurrent index or history writes.
   - If the destination picker does not show the session, run:
       CODEX_HOME=<destination> codex migrate-rollouts --apply
 EOF
@@ -157,6 +175,12 @@ validate_index() {
   jq -e -s 'all(.[]; type == "object" and (.id | type == "string"))' "$file" >/dev/null 2>&1
 }
 
+validate_history() {
+  local file=$1
+  [ -f "$file" ] || return 0
+  jq -e -s 'all(.[]; type == "object" and (.session_id | type == "string"))' "$file" >/dev/null 2>&1
+}
+
 discover_files() {
   local home=$1
   local f
@@ -183,6 +207,16 @@ count_id_entries() {
     return 0
   fi
   jq -c --arg id "$ID" 'select(.id == $id)' "$file" 2>/dev/null |
+    awk 'NF { n++ } END { print n+0 }'
+}
+
+count_history_entries() {
+  local file=$1
+  if [ ! -f "$file" ]; then
+    printf '0\n'
+    return 0
+  fi
+  jq -c --arg id "$ID" 'select(.session_id == $id)' "$file" 2>/dev/null |
     awk 'NF { n++ } END { print n+0 }'
 }
 
@@ -259,10 +293,11 @@ restore_backups() {
 
 abort_after_files() {
   warn "$1"
+  restore_history
   restore_indexes
   rollback_files
   restore_backups
-  die "move aborted; source files and indexes were restored where possible"
+  die "move aborted; source files, history, and indexes were restored where possible"
 }
 
 ensure_target_layout() {
@@ -316,6 +351,64 @@ rewrite_src_index() {
   validate_index "$SRC_INDEX" || return 1
 }
 
+rewrite_history() {
+  local mode
+  local tmp
+
+  if [ ! -f "$DST_HISTORY" ]; then
+    : >"$DST_HISTORY" || return 1
+    chmod 644 "$DST_HISTORY" 2>/dev/null || true
+    DST_HISTORY_CREATED=1
+  fi
+
+  mode=$(file_mode "$DST_HISTORY")
+  tmp=$(mktemp "${DST_HISTORY}.tmp.XXXXXX") || return 1
+  TMP_FILES+=("$tmp")
+
+  jq -s -c --arg id "$ID" --slurpfile src "$SRC_HISTORY" '
+    . as $dst
+    | ($dst | map(select(.session_id != $id))) as $others
+    | ($dst | map(select(.session_id == $id))) as $dst_hist
+    | (($src // []) | map(select(.session_id == $id))) as $src_hist
+    | (($dst_hist + $src_hist) | unique) as $hist
+    | (($others + $hist) | sort_by((.ts // 0) | tonumber? // 0))[]
+  ' "$DST_HISTORY" >"$tmp" || return 1
+
+  chmod "$mode" "$tmp" 2>/dev/null || true
+  mv -- "$tmp" "$DST_HISTORY" || return 1
+  validate_history "$DST_HISTORY" || return 1
+}
+
+rewrite_source_history() {
+  local mode
+  local tmp
+
+  [ -f "$SRC_HISTORY" ] || return 0
+  [ "$SRC_HISTORY_COUNT" -gt 0 ] || return 0
+
+  mode=$(file_mode "$SRC_HISTORY")
+  tmp=$(mktemp "${SRC_HISTORY}.tmp.XXXXXX") || return 1
+  TMP_FILES+=("$tmp")
+
+  jq -c --arg id "$ID" 'select(.session_id != $id)' "$SRC_HISTORY" >"$tmp" || return 1
+  chmod "$mode" "$tmp" 2>/dev/null || true
+  mv -- "$tmp" "$SRC_HISTORY" || return 1
+  validate_history "$SRC_HISTORY" || return 1
+}
+
+restore_history() {
+  if [ "$DST_HISTORY_CREATED" -eq 1 ]; then
+    rm -f -- "$DST_HISTORY" 2>/dev/null || true
+    DST_HISTORY_CREATED=0
+  elif [ -n "$DST_HISTORY_BAK" ] && [ -f "$DST_HISTORY_BAK" ]; then
+    cp -p -- "$DST_HISTORY_BAK" "$DST_HISTORY" 2>/dev/null || true
+  fi
+
+  if [ -n "$SRC_HISTORY_BAK" ] && [ -f "$SRC_HISTORY_BAK" ]; then
+    cp -p -- "$SRC_HISTORY_BAK" "$SRC_HISTORY" 2>/dev/null || true
+  fi
+}
+
 print_plan() {
   local verb=move
   local f
@@ -346,6 +439,33 @@ print_plan() {
     printf '[dry-run] index:   no source entry found; index files would not change\n'
   fi
 
+  case "$HISTORY_STATUS" in
+    disabled)
+      printf '[dry-run] history: skipped (--no-history)\n'
+      ;;
+    missing)
+      printf '[dry-run] history: source history.jsonl not found; skipped\n'
+      ;;
+    invalid-source)
+      printf '[dry-run] history: source history.jsonl is not valid JSONL; skipped\n'
+      ;;
+    invalid-destination)
+      printf '[dry-run] history: destination history.jsonl is not valid JSONL; skipped\n'
+      ;;
+    empty)
+      printf '[dry-run] history: no source entries for %s; skipped\n' "$ID"
+      ;;
+    enabled)
+      if [ "$COPY" -eq 1 ]; then
+        printf '[dry-run] history: merge %s source entry/entries into %s destination entry/entries; source kept\n' \
+          "$SRC_HISTORY_COUNT" "$DST_HISTORY_COUNT"
+      else
+        printf '[dry-run] history: merge %s source entry/entries into %s destination entry/entries; remove source entries\n' \
+          "$SRC_HISTORY_COUNT" "$DST_HISTORY_COUNT"
+      fi
+      ;;
+  esac
+
   if [ "$FORCE" -eq 1 ]; then
     for f in "${SRC_FILES[@]}"; do
       rel=${f#"$SOURCE_HOME"/}
@@ -357,6 +477,10 @@ print_plan() {
 
     if [ "$DST_COUNT" -gt 0 ] && [ -n "$CANONICAL" ]; then
       printf '[dry-run] backup:  %s (existing destination index)\n' "$(backup_path "$DST_INDEX")"
+    fi
+
+    if [ "$HISTORY_STATUS" = enabled ] && [ "$DST_HISTORY_COUNT" -gt 0 ]; then
+      printf '[dry-run] backup:  %s (existing destination history)\n' "$(backup_path "$DST_HISTORY")"
     fi
   fi
 }
@@ -386,6 +510,14 @@ parse_args() {
         ;;
       --force)
         FORCE=1
+        shift
+        ;;
+      --with-history)
+        MIGRATE_HISTORY=1
+        shift
+        ;;
+      --no-history)
+        MIGRATE_HISTORY=0
         shift
         ;;
       --from)
@@ -531,6 +663,8 @@ main() {
 
   SRC_INDEX="$SOURCE_HOME/session_index.jsonl"
   DST_INDEX="$TARGET_HOME/session_index.jsonl"
+  SRC_HISTORY="$SOURCE_HOME/history.jsonl"
+  DST_HISTORY="$TARGET_HOME/history.jsonl"
 
   if [ -f "$SRC_INDEX" ]; then
     validate_index "$SRC_INDEX" ||
@@ -558,6 +692,29 @@ main() {
     fi
   else
     warn "no session_index entry found for $ID in source; only rollout files will be moved"
+  fi
+
+  if [ "$MIGRATE_HISTORY" -eq 0 ]; then
+    HISTORY_STATUS=disabled
+  elif [ ! -f "$SRC_HISTORY" ]; then
+    HISTORY_STATUS=missing
+  elif ! validate_history "$SRC_HISTORY"; then
+    HISTORY_STATUS=invalid-source
+    warn "source history.jsonl is not valid JSONL; history will not be migrated: $SRC_HISTORY"
+  else
+    SRC_HISTORY_COUNT=$(count_history_entries "$SRC_HISTORY")
+    if [ "$SRC_HISTORY_COUNT" -eq 0 ]; then
+      HISTORY_STATUS=empty
+    elif [ -f "$DST_HISTORY" ] && ! validate_history "$DST_HISTORY"; then
+      HISTORY_STATUS=invalid-destination
+      warn "destination history.jsonl is not valid JSONL; history will not be migrated: $DST_HISTORY"
+    else
+      HISTORY_STATUS=enabled
+      DST_HISTORY_COUNT=$(count_history_entries "$DST_HISTORY")
+      if [ "$DST_HISTORY_COUNT" -gt 0 ]; then
+        note "destination history.jsonl already has $DST_HISTORY_COUNT entry/entries for $ID; merging without dropping them"
+      fi
+    fi
   fi
 
   conflicts=()
@@ -592,6 +749,9 @@ main() {
     if [ ! -f "$DST_INDEX" ]; then
       warn "destination session index does not exist (would create): $DST_INDEX"
     fi
+    if [ "$HISTORY_STATUS" = enabled ] && [ ! -f "$DST_HISTORY" ]; then
+      warn "destination history does not exist (would create): $DST_HISTORY"
+    fi
     print_plan
     exit 0
   fi
@@ -614,8 +774,30 @@ main() {
       die "cannot back up source index: $SRC_INDEX"
   fi
 
+  if [ "$HISTORY_STATUS" = enabled ]; then
+    if [ -f "$DST_HISTORY" ]; then
+      DST_HISTORY_BAK=$(mktemp "${TMPDIR:-/tmp}/codex-dst-history.XXXXXX") ||
+        die "cannot create a temporary destination history backup"
+      TMP_FILES+=("$DST_HISTORY_BAK")
+      cp -p -- "$DST_HISTORY" "$DST_HISTORY_BAK" ||
+        die "cannot back up destination history: $DST_HISTORY"
+    fi
+
+    if [ "$COPY" -eq 0 ]; then
+      SRC_HISTORY_BAK=$(mktemp "${TMPDIR:-/tmp}/codex-src-history.XXXXXX") ||
+        die "cannot create a temporary source history backup"
+      TMP_FILES+=("$SRC_HISTORY_BAK")
+      cp -p -- "$SRC_HISTORY" "$SRC_HISTORY_BAK" ||
+        die "cannot back up source history: $SRC_HISTORY"
+    fi
+  fi
+
   if [ "$FORCE" -eq 1 ] && [ "$DST_COUNT" -gt 0 ] && [ -n "$CANONICAL" ]; then
     backup_file "$DST_INDEX" || die "cannot back up destination index: $DST_INDEX"
+  fi
+
+  if [ "$FORCE" -eq 1 ] && [ "$HISTORY_STATUS" = enabled ] && [ "$DST_HISTORY_COUNT" -gt 0 ]; then
+    backup_file "$DST_HISTORY" || die "cannot back up destination history: $DST_HISTORY"
   fi
 
   MOVED_SRC=()
@@ -664,6 +846,21 @@ main() {
     printf '%s: %s -> %s\n' "$verb" "$f" "$dst"
   done
 
+  if [ "$HISTORY_STATUS" = enabled ]; then
+    if ! rewrite_history; then
+      abort_after_files "failed to update destination history: $DST_HISTORY"
+    fi
+    printf 'history: merged %s entry/entries for %s into %s\n' \
+      "$SRC_HISTORY_COUNT" "$ID" "$DST_HISTORY"
+
+    if [ "$COPY" -eq 0 ]; then
+      if ! rewrite_source_history; then
+        abort_after_files "failed to update source history: $SRC_HISTORY"
+      fi
+      printf 'history: removed %s from %s\n' "$ID" "$SRC_HISTORY"
+    fi
+  fi
+
   if [ -n "$CANONICAL" ]; then
     if ! rewrite_dest_index; then
       abort_after_files "failed to update destination session index: $DST_INDEX"
@@ -694,6 +891,20 @@ main() {
     fi
   fi
 
+  if [ "$HISTORY_STATUS" = enabled ]; then
+    after=$(count_history_entries "$DST_HISTORY")
+    if [ "$after" -lt 1 ]; then
+      abort_after_files "destination history verification failed (no entries for $ID)"
+    fi
+
+    if [ "$COPY" -eq 0 ]; then
+      after=$(count_history_entries "$SRC_HISTORY")
+      if [ "$after" -ne 0 ]; then
+        abort_after_files "source history verification failed ($after entries for $ID)"
+      fi
+    fi
+  fi
+
   if [ "$COPY" -eq 0 ]; then
     sessions_root="$SOURCE_HOME/sessions"
     for f in "${SRC_FILES[@]}"; do
@@ -709,6 +920,29 @@ main() {
       done
     done
   fi
+
+  case "$HISTORY_STATUS" in
+    disabled)
+      printf 'history: skipped (--no-history)\n'
+      ;;
+    missing)
+      printf 'history: skipped (no source history.jsonl)\n'
+      ;;
+    invalid-source)
+      printf 'history: skipped (invalid source JSONL)\n'
+      ;;
+    invalid-destination)
+      printf 'history: skipped (invalid destination JSONL)\n'
+      ;;
+    empty)
+      printf 'history: no entries for %s; skipped\n' "$ID"
+      ;;
+    enabled)
+      if [ "$COPY" -eq 1 ]; then
+        printf 'history: source history left unchanged (--copy)\n'
+      fi
+      ;;
+  esac
 
   if [ "$COPY" -eq 1 ]; then
     verb=copied
